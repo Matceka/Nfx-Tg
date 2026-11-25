@@ -1,0 +1,109 @@
+name: Nfx-Tg private release build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Require a private build repository
+        env:
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          if [ "$REPO_PRIVATE" != true ]; then
+            echo "::error::Use a private build repository. APKs contain the Telegram application credentials."
+            exit 1
+          fi
+      - name: Checkout source and submodules
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Configure application locally
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          NFX_KEYSTORE_BASE64: ${{ secrets.NFX_KEYSTORE_BASE64 }}
+          NFX_KEYSTORE_PASSWORD: ${{ secrets.NFX_KEYSTORE_PASSWORD }}
+          NFX_KEY_PASSWORD: ${{ secrets.NFX_KEY_PASSWORD }}
+          NFX_FIREBASE_JSON: ${{ secrets.NFX_FIREBASE_JSON }}
+        run: |
+          python3 - <<'PY'
+          import base64, json, os, pathlib, re
+          required = ("TG_API_ID", "TG_API_HASH", "NFX_KEYSTORE_BASE64", "NFX_KEYSTORE_PASSWORD", "NFX_KEY_PASSWORD", "NFX_FIREBASE_JSON")
+          for name in required:
+              if not os.environ.get(name):
+                  raise SystemExit("Missing required repository secret: " + name)
+          api_id = os.environ["TG_API_ID"]
+          api_hash = os.environ["TG_API_HASH"]
+          if not re.fullmatch(r"[1-9][0-9]{0,9}", api_id) or int(api_id) > 2147483647:
+              raise SystemExit("Invalid TG_API_ID")
+          if not re.fullmatch(r"[a-fA-F0-9]{32}", api_hash):
+              raise SystemExit("Invalid TG_API_HASH")
+          p = pathlib.Path("TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java")
+          s = p.read_text()
+          for pattern, replacement in [
+              (r"(public static int APP_ID\s*=\s*)[^;]+;", lambda m: m[1] + api_id + ";"),
+              (r"(public static String APP_HASH\s*=\s*)[^;]+;", lambda m: m[1] + '"' + api_hash + '";'),
+              (r"(public static boolean CHECK_UPDATES\s*=\s*)true;", lambda m: m[1] + "false;")
+          ]:
+              s, n = re.subn(pattern, replacement, s)
+              if n != 1:
+                  raise SystemExit("Expected configuration field missing")
+          p.write_text(s)
+          try:
+              key = base64.b64decode(os.environ["NFX_KEYSTORE_BASE64"], validate=True)
+              firebase = json.loads(os.environ["NFX_FIREBASE_JSON"])
+              packages = {c["client_info"]["android_client_info"]["package_name"] for c in firebase["client"]}
+          except Exception:
+              raise SystemExit("Invalid keystore or Firebase configuration")
+          if not {"org.telegram.messenger", "com.nfxtg.messenger.web"}.issubset(packages):
+              raise SystemExit("Firebase configuration must contain both required Android app package names")
+          p = pathlib.Path("TMessagesProj/config/release.keystore")
+          p.write_bytes(key)
+          p.chmod(0o600)
+          for p in (pathlib.Path("TMessagesProj/google-services.json"), pathlib.Path("TMessagesProj_AppStandalone/google-services.json")):
+              p.write_text(json.dumps(firebase))
+          for p in pathlib.Path("TMessagesProj/src/main/res").glob("values*/strings.xml"):
+              s = p.read_text()
+              t = re.sub(r'(<string name="AppName">)[^<]*(</string>)', r'\g<1>Nfx-Tg\g<2>', s)
+              if t != s:
+                  p.write_text(t)
+          PY
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+      - name: Install Android build tools
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
+      - name: Compile signed standalone APK
+        env:
+          NFX_KEYSTORE_PASSWORD: ${{ secrets.NFX_KEYSTORE_PASSWORD }}
+          NFX_KEY_PASSWORD: ${{ secrets.NFX_KEY_PASSWORD }}
+        run: |
+          chmod +x gradlew
+          ./gradlew :TMessagesProj_AppStandalone:assembleAfatStandalone --no-daemon --max-workers=2 \
+            -PAPP_PACKAGE=com.nfxtg.messenger \
+            -PRELEASE_KEY_ALIAS=nfxtg \
+            "-PRELEASE_STORE_PASSWORD=$NFX_KEYSTORE_PASSWORD" \
+            "-PRELEASE_KEY_PASSWORD=$NFX_KEY_PASSWORD"
+      - name: Verify APK signature
+        run: |
+          APK=TMessagesProj_AppStandalone/build/outputs/apk/afat/standalone/app.apk
+          test -s "$APK"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs "$APK"
+      - name: Upload private test artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nfx-Tg-test-apk
+          path: TMessagesProj_AppStandalone/build/outputs/apk/afat/standalone/app.apk
+          if-no-files-found: error
+          retention-days: 3
