@@ -1,0 +1,37 @@
+name: Nfx-Tg baseline build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout source and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install Android build tools
+        shell: bash
+        run: |
+          sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
+      - name: Compile upstream debug baseline
+        shell: bash
+        run: |
+          chmod +x gradlew
+          ./gradlew :TMessagesProj_AppStandalone:assembleAfatDebug --no-daemon --max-workers=2
+      - name: Verify compilation output
+        shell: bash
+        run: |
+          find TMessagesProj_AppStandalone/build/outputs/apk -name '*.apk' -type f -print
+          echo "Compilation check only. Upstream placeholder credentials and signing key are not suitable for a distributed or authenticated client."
